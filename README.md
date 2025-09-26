@@ -103,3 +103,123 @@
 - Валидация входных данных
 - Ограничение прав доступа к БД
 
+#SQl 
+-- Формирование списка на обзвон клиентов о предстоящих платежах
+-- Назначение: Выборка клиентов для предупреждения о скорой оплате по траншу договора
+-- Бизнес-логика: Проактивное информирование клиентов до наступления даты платежа
+-- Особенности: Учет часовых поясов, календаря событий, размера задолженности
+    
+    select 
+    p.id person_id, 
+    d_main.id main_id, 
+    d_part.id part_id,
+    -- Основной долг: основной долг, просроченный основной долг, проценты и просроченные проценты
+    d_main.basic_sum main_basic_sum, 
+    d_main.exp_basic_sum main_exp_basic_sum,
+    d_main.percent_sum main_percent_sum, 
+    d_main.exp_percent_sum main_exp_percent_sum,
+    -- Частичный долг (транш): аналогичные суммы по части долга
+    d_part.basic_sum part_basic_sum, 
+    d_part.exp_basic_sum part_exp_basic_sum,
+    d_part.percent_sum part_percent_sum, 
+    d_part.exp_percent_sum part_exp_percent_sum,
+    -- Часовой пояс клиента для определения времени контакта
+    nvl(p.person_gmt, 3) gmt, 
+    -- Дата ближайшего платежа для приоритизации
+    ps.dt payment_dt
+    from debt d_part  -- Работаем с частями долгов (траншами)
+    -- Подзапрос: Сумма предстоящих платежей по каждому долгу на ближайшие N дней
+    join ( 
+        select 
+            ext_id, 
+            sum(ps1.PAY_BASIC_SUM) sum_op  -- Общая сумма к оплате
+        from corpcon.payment_schedule ps1
+        join corpcon.debt d2 on d2.id = ps1.parent_id 
+            and d2.main_part is null  -- Только части долгов (не основные)
+            and nvl(ps1.PAY_BASIC_SUM, 0) > 0  -- Только платежи с основной суммой долга
+            and ps1.dt between trunc(sysdate) and  -- Платежи начиная с сегодня
+                trunc(sysdate) + (
+                    select c.value from corpcon.const_value c 
+                    where c.name = 'GROUP_PRC_DAYS'  -- Количество дней для планирования (из настроек)
+                )
+            -- Проверка, что долг относится к подходящим типам договора
+            and exists (
+                select 1 from corpcon.param_admin pa
+                where pa.no_active = 0      
+                    and pa.typ = 1          
+                    and pa.debt_group = 1   
+                    and pa.name_id = d2.name_id  -- Соответствие продукту
+            )
+        group by d2.ext_id  -- Группировка по внешнему ID долга
+    ) op on op.ext_id = d_part.ext_id  -- Связь по внешнему идентификатору
+
+    -- Присоединяем график платежей для определения дат
+    join payment_schedule ps on d_part.id = ps.parent_id
+    and nvl(ps.PAY_BASIC_SUM, 0) > 0  -- Только платежи с основной суммой долга
+    and ps.dt between trunc(sysdate) and  -- В ближайшие N дней
+       trunc(sysdate) + (select c.value from const_value c where c.name = 'GROUP_PRC_DAYS')
+
+    -- Основной долг (для получения полной информации о клиенте)
+    left join debt d_main on d_main.ext_id = d_part.ext_id
+    and d_main.main_part = 1  -- Только основная часть долга
+
+    -- Данные клиента
+    left join person p on p.id = d_main.parent_id
+    -- Информация о счете для проверки баланса
+    left join account ac on ac.account_id = d_main.account
+
+    where 
+    -- Фильтр по источнику данных: договоры из системы SAE
+    d_main.src = 'SAE'
+    
+    and d_main.name_id in (
+        select name_id from corpcon.param_admin 
+        where typ=1 and no_active=0 and debt_group=1
+    )
+    
+    -- В части долга должна быть положительная сумма (основной долг + основной просроченный долг + просроченные проценты)
+    and nvl(d_part.basic_sum, 0) + nvl(d_part.exp_basic_sum, 0) +
+        nvl(d_part.exp_percent_sum, 0) > 0
+    
+    -- Баланс счета меньше суммы предстоящих платежей (признак необходимости действий)
+    and (ac.balance < op.sum_op)
+    
+    -- Работаем только с частями долгов (не основными записями)
+    and nvl(d_part.main_part, 0) = 0
+    
+    -- Основной долг не должен иметь просроченных сумм (взыскание по частям)
+    and (nvl(d_main.exp_basic_sum,0)+nvl(d_main.exp_percent_sum_6,0)+
+         nvl(d_main.exp_percent_sum_106,0)+nvl(d_main.due_sum,0)) <= 0
+    
+    -- Исключаем долги с специальной маркировкой (mark4=9 - кредитные каникулы)
+    and nvl(d_main.mark4, 0) <> 9
+    
+    -- условие по календарю событий:
+    -- Либо есть запланированное событие на сегодня для ответственного сотрудника
+    -- Либо вообще нет запланированных событий для этого менеджера
+    and (
+        exists (
+            select /*+index(ec)*/ null from events_calendar ec
+            where ec.ext_id = d_main.ext_id
+                and nvl(ec.block_flag, 0) = 0  -- Активное событие
+                and d_main.r_user_id_prc = ec.plan_user_id  -- Ответственный сотрудник
+                and trunc(ec.plan_dt) = trunc(sysdate)  -- Запланировано на сегодня
+        )
+        or
+        not exists (
+            select /*+index(ec)*/ null from events_calendar ec
+            where ec.ext_id = d_main.ext_id
+                and nvl(ec.block_flag, 0) = 0
+                and d_main.r_user_id_prc = ec.plan_user_id
+        )
+    )  -- Сортировка для определения приоритета обработки: 
+    order by 
+    ps.dt asc,  -- Сначала ближайшие даты платежей
+    nvl(p.person_gmt, 3) desc,  -- Учитываем часовой пояс для времени контакта
+    -- Сумма долга в пересчете на валюту (крупные долги - выше приоритет)
+    (d_main.basic_sum + d_main.exp_basic_sum + d_main.percent_sum +
+     d_main.exp_percent_sum) * GetCursCB2(trunc(d_main.load_dt), d_main.currency) desc,
+    d_main.id desc  -- Для однозначности при одинаковых приоритетах
+
+
+
